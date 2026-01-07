@@ -71,12 +71,7 @@ def train_one_epoch(
     grad_clip_norm: Optional[float] = None,
     log_every: int = 0,
 ) -> Tuple[float, float]:
-    """
-    Train for a single epoch.
 
-    Returns:
-        (avg_loss, avg_acc_top1)
-    """
     model.train()
     if criterion is None:
         criterion = nn.CrossEntropyLoss()

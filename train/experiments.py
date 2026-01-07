@@ -144,9 +144,7 @@ def run_trial(
     return result, history
 
 
-# -----------------------------
-# FASE 0: sanity check
-# -----------------------------
+
 def phase0_sanity(
     train_loader,
     val_loader,
@@ -182,9 +180,7 @@ def phase0_sanity(
     return res
 
 
-# -----------------------------
-# FASE 1: scheduler sweep
-# -----------------------------
+
 def phase1_scheduler_sweep(
     train_loader,
     val_loader,
@@ -224,7 +220,6 @@ def phase1_scheduler_sweep(
         results.append(res)
         histories[sch] = hist
 
-    # ordena pelo melhor val acc
     results_sorted = sorted(results, key=lambda d: d["best_val_acc"], reverse=True)
 
     print("\nPHASE 1 summary (sorted by best_val_acc):")
@@ -234,7 +229,6 @@ def phase1_scheduler_sweep(
             f" | test_acc {r['test_acc']:.4f} | minutes {r['run_minutes']:.1f}"
         )
 
-    # salva CSV
     with open(save_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(results_sorted[0].keys()))
         writer.writeheader()

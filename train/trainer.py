@@ -52,11 +52,11 @@ class TrainConfig:
     momentum: float = 0.9
     nesterov: bool = False
 
-    scheduler_name: str = "cosine"  # cosine | step | multistep | none | cosine_warmup
-    eta_min: float = 0.0  # for cosine
-    warmup_epochs: int = 5  # for cosine_warmup
+    scheduler_name: str = "cosine"  
+    eta_min: float = 0.0  
+    warmup_epochs: int = 5  
 
-    # training niceties
+    
     amp: bool = True
     grad_clip_norm: Optional[float] = None
     print_every: int = 10

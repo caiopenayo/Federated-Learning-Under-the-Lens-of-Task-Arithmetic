@@ -73,11 +73,14 @@ def run_trial(
     resume_path = os.path.join(out_dir, f"last_{scheduler_name}_seed{seed}.pth")
     start_epoch = 1
     best_val_acc = -1.0
+    best_epoch = 0
+
 
     if resume and os.path.exists(resume_path):
         start_epoch, best_val_acc = load_last_ckpt(
             resume_path, model, optimizer, scheduler, scaler, device
         )
+        best_epoch = start_epoch - 1
         print(f"[{scheduler_name}] Resuming from epoch {start_epoch} (best_val_acc={best_val_acc:.4f})")
 
     history = {

@@ -8,6 +8,7 @@ def build_dino_vit(
     img_size=160,
     device=None,
     train_mode=True,
+    pretrained: bool = True,
 ):
     """
     Retorna um modelo DINO ViT-S/16 com uma head Linear para CIFAR-100.
@@ -20,7 +21,7 @@ def build_dino_vit(
 
     backbone = timm.create_model(
         "vit_small_patch16_224.dino",
-        pretrained=True,
+        pretrained=pretrained,
         num_classes=0,     # retorna features
         img_size=img_size, # <-- chave para acelerar (160)
     )

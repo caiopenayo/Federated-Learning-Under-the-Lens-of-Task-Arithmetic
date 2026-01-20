@@ -157,7 +157,7 @@ def run_trial(
 
     run_secs = time.time() - t_run0
 
-    # Test com o melhor checkpoint
+    # Test with the best checkpoint
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
@@ -282,7 +282,7 @@ def phase1_scheduler_sweep(
         results.append(res)
         histories[sch] = hist
 
-    # ordena pelo melhor val acc
+    # sort by best val acc
     results_sorted = sorted(results, key=lambda d: d["best_val_acc"], reverse=True)
 
     print("\nPHASE 1 summary (sorted by best_val_acc):")
@@ -309,8 +309,8 @@ def phase2_lr_wd_grid(
     val_loader,
     test_loader,
     *,
-    scheduler_name="cosine",          # vencedor da fase 1
-    epochs=15,                        # mantenha igual ao da fase 1 para comparar rápido
+    scheduler_name="cosine",          # phase 1 winner
+    epochs=15,                        # keep same of phase 1 to compare fast
     lr_list=(0.003, 0.005, 0.01, 0.02),
     wd_list=(1e-4, 3e-4, 5e-4, 1e-3),
     momentum=0.9,
@@ -349,7 +349,7 @@ def phase2_lr_wd_grid(
                 resume=resume
             )
 
-            # se algum trial der NaN, joga pro fim
+            # if some trial = NaN, put on the end
             if res["best_val_acc"] != res["best_val_acc"]:  # NaN check
                 res["best_val_acc"] = -1.0
 
@@ -365,7 +365,7 @@ def phase2_lr_wd_grid(
             f"test_acc {r['test_acc']:.4f}"
         )
 
-    # salva CSV
+    # save CSV
     with open(save_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(results_sorted[0].keys()))
         writer.writeheader()

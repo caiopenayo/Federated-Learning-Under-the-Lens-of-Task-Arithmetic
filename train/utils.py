@@ -14,7 +14,7 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # determinismo pode deixar mais lento; para benchmark/velocidade, deixe False
+    # Determinism can slow things down; for benchmark/speed, leave it as False.
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
@@ -23,11 +23,11 @@ def make_scheduler(name, optimizer, epochs):
     if name == "cosine":
         return CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     if name == "step":
-        # bem comum para comparação: cai em 70% das épocas
+        # common for comparison: falls in 70% of seasons
         step_size = max(1, int(0.7 * epochs))
         return StepLR(optimizer, step_size=step_size, gamma=0.1)
     if name == "multistep":
-        # milestones perto do final para comparação rápida
+        # milestones nearing completion for quick comparison
         m1 = max(1, int(0.6 * epochs))
         m2 = max(m1 + 1, int(0.85 * epochs))
         return MultiStepLR(optimizer, milestones=[m1, m2], gamma=0.1)

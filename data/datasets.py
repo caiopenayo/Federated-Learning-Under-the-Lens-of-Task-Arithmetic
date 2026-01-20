@@ -7,7 +7,7 @@ from torchvision import datasets, transforms
 
 def get_cifar100_transforms(img_size=160):
     """
-    Retorna transforms de treino e teste compatíveis com ViT/DINO.
+    Returns training and test transforms compatible with ViT/DINO.
     """
     train_transform = transforms.Compose([
         transforms.Resize(img_size),
@@ -33,7 +33,7 @@ def get_cifar100_transforms(img_size=160):
 
 def get_cifar100(train_transform, test_transform, val_ratio=0.1, root="./data", seed=42):
     """
-    Retorna:
+    Returns:
       train_subset, val_subset, test_dataset
     """
     full_train = datasets.CIFAR100(

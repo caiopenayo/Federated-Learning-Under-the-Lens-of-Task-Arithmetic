@@ -1,201 +1,145 @@
 import copy
-import numpy as np
-
-
 import torch
+import numpy as np
 from torch import nn, optim
 
-
-
-
 def fed_avg_aggregate(global_model, client_models, client_weights):
-   """
-   Weighted FedAvg:
-   w_global = sum_k (n_k * w_k) / sum_k n_k
-   """
-   global_dict = global_model.state_dict()
+    """
+    Aggregates client models into the global model using weighted averaging.
+    w_global = sum(n_k * w_k) / sum(n_k)
+    """
+    global_dict = global_model.state_dict()
+    new_dict = copy.deepcopy(global_dict)
+    
+    # Reset accumulators to zero
+    for key in new_dict.keys():
+        new_dict[key] = torch.zeros_like(new_dict[key], dtype=torch.float32)
+        
+    total_weight = sum(client_weights)
+    
+    for client_model, weight in zip(client_models, client_weights):
+        client_dict = client_model.state_dict()
+        for key in new_dict.keys():
+            # Accumulate weighted parameters
+            # Use float32 for accumulation to avoid overflow/precision issues
+            new_dict[key] += weight * client_dict[key].to(torch.float32)
+            
+    # Normalize
+    for key in new_dict.keys():
+        new_dict[key] = (new_dict[key] / total_weight).to(global_dict[key].dtype)
+        
+    global_model.load_state_dict(new_dict)
+    return global_model
 
-
-   # float32 accumulators (safer)
-   new_dict = {k: torch.zeros_like(v, dtype=torch.float32) for k, v in global_dict.items()}
-   total_weight = float(sum(client_weights))
-
-
-   if total_weight == 0:
-       return global_model  # nothing to aggregate
-
-
-   for client_model, weight in zip(client_models, client_weights):
-       client_dict = client_model.state_dict()
-       w = float(weight)
-       for k in new_dict:
-           new_dict[k] += w * client_dict[k].float()
-
-
-   for k in new_dict:
-       new_dict[k] = (new_dict[k] / total_weight).to(global_dict[k].dtype)
-
-
-   global_model.load_state_dict(new_dict)
-   return global_model
-
-
-
-
-def client_update(model, loader, steps, lr, device, momentum=0.9, weight_decay=0.0):
-   """
-   Perform J local optimization steps on one client.
-   steps = J (mini-batch steps), NOT epochs.
-   """
-   model.train()
-   optimizer = optim.SGD(model.parameters(), lr=lr, momentum=momentum, weight_decay=weight_decay)
-   criterion = nn.CrossEntropyLoss()
-
-
-   it = iter(loader)
-   loss_sum = 0.0
-
-
-   for _ in range(steps):
-       try:
-           x, y = next(it)
-       except StopIteration:
-           it = iter(loader)
-           x, y = next(it)
-
-
-       x, y = x.to(device), y.to(device)
-
-
-       optimizer.zero_grad()
-       out = model(x)
-       loss = criterion(out, y)
-       loss.backward()
-       optimizer.step()
-
-
-       loss_sum += loss.item()
-
-
-   return model, (loss_sum / steps)
-
-
-
-
-@torch.no_grad()
-def evaluate_accuracy(model, loader, device):
-   """
-   Compute accuracy (%) on a dataloader.
-   """
-   model.eval()
-   correct, total = 0, 0
-   for x, y in loader:
-       x, y = x.to(device), y.to(device)
-       out = model(x)
-       pred = out.argmax(dim=1)
-       correct += (pred == y).sum().item()
-       total += y.size(0)
-   return 100.0 * correct / max(total, 1)
-
-
-
+def client_update(model, train_loader, steps, lr, device):
+    """
+    Performs J local steps of training on a client.
+    """
+    model.train()
+    optimizer = optim.SGD(model.parameters(), lr=lr) # Standard SGD for FedAvg
+    criterion = nn.CrossEntropyLoss()
+    
+    iterator = iter(train_loader)
+    loss_accum = 0.0
+    
+    for _ in range(steps):
+        try:
+            data, target = next(iterator)
+        except StopIteration:
+            # Restart iterator if we run out of data
+            iterator = iter(train_loader)
+            data, target = next(iterator)
+            
+        data, target = data.to(device), target.to(device)
+        
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion(output, target)
+        loss.backward()
+        optimizer.step()
+        
+        loss_accum += loss.item()
+        
+    return model, loss_accum / steps
 
 def run_fedavg_experiment(
-   base_model,
-   client_loaders,
-   test_loader,
-   rounds,
-   C,
-   J,
-   lr,
-   device="cuda",
-   log_every=5,
-   seed=0,
-   momentum=0.9,
-   weight_decay=0.0001,
+    base_model, 
+    client_loaders, 
+    test_loader, 
+    rounds, 
+    C, 
+    J, 
+    lr=0.01, 
+    device="cuda",
+    log_every=10
 ):
-   """
-   FedAvg main loop.
+    """
+    Runs the FedAvg algorithm.
+    params:
+        C: Client participation rate (0.0 to 1.0)
+        J: Number of local steps
+    """
+    # Deep copy global model
+    global_model = copy.deepcopy(base_model).to(device)
+    num_clients = len(client_loaders)
+    m = max(int(C * num_clients), 1) # Number of clients to sample
+    
+    history = {'rounds': [], 'test_acc': [], 'loss': []}
+    
+    print(f"  [FedAvg] Start: {rounds} rounds, C={C} ({m} clients), J={J} steps")
+    
+    for r in range(1, rounds + 1):
+        # 1. Server selects subset of clients
+        selected_indices = np.random.choice(range(num_clients), m, replace=False)
+        
+        local_models = []
+        client_weights = []
+        avg_loss = 0
+        
+        # 2. Clients train
+        for client_idx in selected_indices:
+            loader = client_loaders[client_idx]
+            
+            # Skip empty clients (if any)
+            if loader is None or len(loader) == 0:
+                continue
+                
+            # Create local copy
+            local_model = copy.deepcopy(global_model)
+            
+            # Local Update (J steps)
+            trained_model, loss = client_update(local_model, loader, steps=J, lr=lr, device=device)
+            
+            local_models.append(trained_model)
+            # Weight is number of samples (or 1 for simple FedAvg)
+            # Strictly, FedAvg uses n_k (number of samples)
+            # Assuming batch_size is constant, we can use len(loader) approx or exact counts if known.
+            # Using 1.0 for simplicity or sample count if available.
+            client_weights.append(len(loader.dataset) if hasattr(loader, 'dataset') else 1.0)
+            avg_loss += loss
+            
+        # 3. Server Aggregation
+        if local_models:
+            global_model = fed_avg_aggregate(global_model, local_models, client_weights)
+        
+        # Evaluation
+        if r % log_every == 0 or r == rounds:
+            global_model.eval()
+            correct = 0
+            total = 0
+            with torch.no_grad():
+                for data, target in test_loader:
+                    data, target = data.to(device), target.to(device)
+                    outputs = global_model(data)
+                    _, predicted = torch.max(outputs.data, 1)
+                    total += target.size(0)
+                    correct += (predicted == target).sum().item()
+            
+            acc = 100 * correct / total
+            history['rounds'].append(r)
+            history['test_acc'].append(acc)
+            history['loss'].append(avg_loss / m)
+            print(f"    Round {r:03d} | Test Acc: {acc:.2f}% | Train Loss: {avg_loss/m:.4f}")
+            
+    return history
 
-
-   K = len(client_loaders)
-   Each round:
-     - sample m = max(int(C*K), 1) clients
-     - each trains for J local steps
-     - server aggregates using weighted average by client dataset size
-     - evaluate test accuracy periodically
-
-
-   Returns:
-     history dict with rounds, test_acc, train_loss
-   """
-   np.random.seed(seed)
-   torch.manual_seed(seed)
-
-
-   global_model = copy.deepcopy(base_model).to(device)
-
-
-   num_clients = len(client_loaders)
-   m = max(int(C * num_clients), 1)
-
-
-   history = {"rounds": [], "test_acc": [], "train_loss": []}
-
-
-   print(f"[FedAvg] rounds={rounds}, K={num_clients}, C={C} => clients/round={m}, J={J}, lr={lr}")
-
-
-   for r in range(1, rounds + 1):
-       selected = np.random.choice(num_clients, m, replace=False)
-
-
-       local_models = []
-       weights = []
-       losses = []
-
-
-       for idx in selected:
-           loader = client_loaders[idx]
-           if loader is None or len(loader) == 0:
-               continue
-
-
-           local_model = copy.deepcopy(global_model)
-
-
-           trained_model, client_loss = client_update(
-               local_model,
-               loader,
-               steps=J,
-               lr=lr,
-               device=device,
-               momentum=momentum,
-               weight_decay=weight_decay,
-           )
-
-
-           local_models.append(trained_model)
-           weights.append(len(loader.dataset) if hasattr(loader, "dataset") else 1.0)
-           losses.append(client_loss)
-
-
-       if local_models:
-           global_model = fed_avg_aggregate(global_model, local_models, weights)
-
-
-       # log
-       if (r % log_every == 0) or (r == 1) or (r == rounds):
-           test_acc = evaluate_accuracy(global_model, test_loader, device)
-           avg_loss = float(np.mean(losses)) if len(losses) > 0 else float("nan")
-
-
-           history["rounds"].append(r)
-           history["test_acc"].append(test_acc)
-           history["train_loss"].append(avg_loss)
-
-
-           print(f"Round {r:03d} | Test Acc: {test_acc:6.2f}% | Avg client loss: {avg_loss:.4f}")
-
-
-   return history, global_model

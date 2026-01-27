@@ -22,56 +22,82 @@ def _init_like_named_params(model: nn.Module, fill_value: float = 0.0) -> Dict[s
 def compute_fisher_diag_scores(
     model: nn.Module,
     dataloader: Iterable,
-    criterion: nn.Module,
+    criterion: nn.Module,  # mantido por compatibilidade; não é usado no TaLoS-style
     device: torch.device,
     *,
     max_batches: Optional[int] = None,
     param_filter: Optional[Callable[[str, torch.Tensor], bool]] = None,
 ) -> ScoreDict:
     """
-    Approx diagonal Fisher via empirical E[grad^2] over batches.
+    TaLoS-style Fisher-diag proxy:
+      - model.eval()
+      - for each batch: forward logits
+      - sample a class from Categorical(logits)
+      - gather the selected logit per sample
+      - do backward per-sample on that selected logit
+      - accumulate grad^2 (no averaging), approx E[grad^2]
     """
-    model.train()
-    scores = _init_like_named_params(model, fill_value=0.0)
+    # TaLoS uses eval() for deterministic behavior (no dropout noise, etc.)
+    model = model.to(device)
+    model.eval()
 
     if param_filter is None:
         def param_filter(name: str, p: torch.Tensor) -> bool:
             return bool(p.requires_grad)
 
-    used = 0
+    # Keep a score tensor per parameter name (same shape as param)
+    scores: ScoreDict = _init_like_named_params(model, fill_value=0.0)
+
+    used_samples = 0
+
     for b_idx, batch in enumerate(dataloader):
         if max_batches is not None and b_idx >= max_batches:
             break
 
-        if isinstance(batch, (tuple, list)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
+        if isinstance(batch, (tuple, list)) and len(batch) >= 1:
+            x = batch[0]
         else:
-            raise ValueError("Batch format not supported. Expected (x, y).")
+            raise ValueError("Batch format not supported. Expected (x, y) or (x, ...).")
 
         x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
 
-        model.zero_grad(set_to_none=True)
-        logits = model(x)
-        loss = criterion(logits, y)
-        loss.backward()
+        # We need gradients, so do NOT wrap this forward in torch.no_grad().
+        logits = model(x)  # [B, num_classes]
 
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if not param_filter(name, p):
-                continue
-            if p.grad is None:
-                continue
-            scores[name].add_(p.grad.detach() ** 2)
+        # Sample class indices from model distribution (TaLoS-style)
+        with torch.no_grad():
+            sampled_idx = torch.distributions.Categorical(logits=logits).sample()  # [B]
+            sampled_idx = sampled_idx.view(-1, 1)  # [B, 1]
 
-        used += 1
+        # Gather the selected logit for each sample: [B, 1] -> squeeze to [B]
+        selected = logits.gather(1, sampled_idx).squeeze(1)
 
-    if used == 0:
-        raise RuntimeError("No batches were used to compute Fisher scores.")
+        # Backprop per-sample, accumulating grad^2
+        # Note: retain_graph=True needed because we backward multiple times on same graph
+        batch_size = selected.shape[0]
+        for i in range(batch_size):
+            model.zero_grad(set_to_none=True)
+            torch.autograd.backward(selected[i], retain_graph=True)
 
-    for name in list(scores.keys()):
-        scores[name].div_(float(used))
+            for name, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if not param_filter(name, p):
+                    continue
+                if p.grad is None:
+                    continue
+                scores[name].add_(p.grad.detach().pow(2))
+
+            used_samples += 1
+
+        # Free graph ASAP
+        del logits, selected
+
+    if used_samples == 0:
+        raise RuntimeError("No samples were used to compute TaLoS-style Fisher scores.")
+
+    # TaLoS code (no snippet) accumulates without normalizing.
+    # If you WANT to match it strictly, keep as-is (no division).
     return scores
 
 

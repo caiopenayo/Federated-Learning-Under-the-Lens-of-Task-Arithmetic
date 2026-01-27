@@ -2,6 +2,7 @@ import copy
 import torch
 import numpy as np
 from torch import nn, optim
+from optim.sparse_sgdm import SparseSGDM
 
 def fed_avg_aggregate(global_model, client_models, client_weights):
     """
@@ -31,12 +32,15 @@ def fed_avg_aggregate(global_model, client_models, client_weights):
     global_model.load_state_dict(new_dict)
     return global_model
 
-def client_update(model, train_loader, steps, lr, device):
+def client_update(model, train_loader, steps, lr, device, mask=None):
     """
     Performs J local steps of training on a client.
     """
     model.train()
-    optimizer = optim.SGD(model.parameters(), lr=lr) # Standard SGD for FedAvg
+    if mask is None:
+        optimizer = optim.SGD(model.parameters(), lr=lr) # Standard SGD for FedAvg
+    else:
+        optimizer = SparseSGDM(model.parameters(), lr=lr, mask=mask)
     criterion = nn.CrossEntropyLoss()
     
     iterator = iter(train_loader)
@@ -71,7 +75,8 @@ def run_fedavg_experiment(
     J, 
     lr=0.01, 
     device="cuda",
-    log_every=10
+    log_every=10,
+    mask=None,
 ):
     """
     Runs the FedAvg algorithm.
@@ -132,7 +137,7 @@ def run_fedavg_experiment(
             local_model = copy.deepcopy(global_model)
             
             # Local Update (J steps)
-            trained_model, loss = client_update(local_model, loader, steps=J, lr=lr, device=device)
+            trained_model, loss = client_update(local_model, loader, steps=J, lr=lr, device=device, mask=mask)
             
             local_models.append(trained_model)
             # Weight is number of samples (or 1 for simple FedAvg)

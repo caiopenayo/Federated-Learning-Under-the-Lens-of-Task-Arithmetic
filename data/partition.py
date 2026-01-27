@@ -104,7 +104,7 @@ def make_client_loaders(train_subset, client_indices, batch_size=64, num_workers
     return loaders
 
 def make_dataset_loaders(train, val, test):
-    train_loader = DataLoader(train, batch_size=128, shuffle=True, num_workers=0, pin_memory=False)
-    val_loader   = DataLoader(val,   batch_size=256, shuffle=False, num_workers=0, pin_memory=False)
-    test_loader  = DataLoader(test,  batch_size=256, shuffle=False, num_workers=0, pin_memory=False)
+    train_loader = DataLoader(train, batch_size=128, shuffle=True, num_workers=4, pin_memory=True, persistent_workers=True)
+    val_loader   = DataLoader(val,   batch_size=256, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
+    test_loader  = DataLoader(test,  batch_size=256, shuffle=False, num_workers=4, pin_memory=True, persistent_workers=True)
     return train_loader, val_loader, test_loader

@@ -44,14 +44,21 @@ def noniid_shard_by_nc_disjoint(train_subset, K, Nc, seed=42, num_classes=100):
     for c in class_to_pool:
         rng.shuffle(class_to_pool[c])
 
-    # 3) escolher Nc classes por cliente, tentando evitar "oversubscription"
-    # Estratégia: sempre escolher as classes com mais exemplos restantes (greedy) com desempate aleatório.
-    client_classes = []
+    # 3) escolher classes e alocar exemplos por cliente (SEM reposição)
+    # IMPORTANTE: escolher classes ANTES de consumir para *todos* os clientes causa oversubscription,
+    # especialmente para Nc pequeno (ex.: Nc=1), deixando muitos clientes vazios.
+    # Aqui fazemos escolha + consumo sequencialmente para refletir o estado atual das pools.
+    client_indices = [[] for _ in range(K)]
+    client_classes = [[] for _ in range(K)]
+
     for k in range(K):
+        target = client_sizes[k]
+        if target == 0:
+            continue
+
         # classes candidatas com pelo menos 1 exemplo restante
         candidates = [c for c in range(num_classes) if len(class_to_pool.get(c, [])) > 0]
         if len(candidates) == 0:
-            client_classes.append([])
             continue
 
         # ordena por tamanho do pool (desc), com ruído aleatório pra desempate
@@ -59,16 +66,7 @@ def noniid_shard_by_nc_disjoint(train_subset, K, Nc, seed=42, num_classes=100):
         candidates.sort(key=lambda c: len(class_to_pool[c]), reverse=True)
 
         chosen = candidates[:Nc] if len(candidates) >= Nc else candidates
-        client_classes.append(chosen)
-
-    # 4) alocar exemplos para cada cliente consumindo as pools (SEM reposição)
-    client_indices = [[] for _ in range(K)]
-
-    for k in range(K):
-        chosen = client_classes[k]
-        target = client_sizes[k]
-        if len(chosen) == 0 or target == 0:
-            continue
+        client_classes[k] = chosen
 
         # round-robin nas classes escolhidas para manter mistura (quando Nc>1)
         ptr = 0
@@ -78,12 +76,10 @@ def noniid_shard_by_nc_disjoint(train_subset, K, Nc, seed=42, num_classes=100):
 
             pool = class_to_pool.get(c, [])
             if len(pool) == 0:
-                # essa classe acabou; verifica se ainda existe alguma das classes escolhidas com exemplos
                 if all(len(class_to_pool.get(cc, [])) == 0 for cc in chosen):
                     break  # não dá pra completar mantendo o requisito "somente Nc classes"
                 continue
 
-            # consome 1 exemplo (disjunto!)
             client_indices[k].append(pool.pop())
 
     return client_indices, client_classes

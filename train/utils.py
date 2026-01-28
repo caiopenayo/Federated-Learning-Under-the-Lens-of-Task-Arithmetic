@@ -14,7 +14,6 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # determinismo pode deixar mais lento; para benchmark/velocidade, deixe False
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
@@ -23,24 +22,15 @@ def make_scheduler(name, optimizer, epochs):
     if name == "cosine":
         return CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     if name == "step":
-        # bem comum para comparação: cai em 70% das épocas
         step_size = max(1, int(0.7 * epochs))
         return StepLR(optimizer, step_size=step_size, gamma=0.1)
     if name == "multistep":
-        # milestones perto do final para comparação rápida
         m1 = max(1, int(0.6 * epochs))
         m2 = max(m1 + 1, int(0.85 * epochs))
         return MultiStepLR(optimizer, milestones=[m1, m2], gamma=0.1)
     if name == "none":
         return None
     raise ValueError(f"Scheduler desconhecido: {name}")
-
-
-
-
-
-
-
 
 @dataclass
 class AverageMeter:
@@ -74,12 +64,7 @@ def train_one_epoch(
     grad_clip_norm: Optional[float] = None,
     log_every: int = 0,
 ) -> Tuple[float, float]:
-    """
-    Train for a single epoch.
-
-    Returns:
-        (avg_loss, avg_acc_top1)
-    """
+    
     model.train()
     if criterion is None:
         criterion = nn.CrossEntropyLoss()

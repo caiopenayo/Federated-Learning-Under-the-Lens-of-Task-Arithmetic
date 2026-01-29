@@ -44,11 +44,14 @@ def run_trial(
     device=None,
     out_dir="runs_sched",
     log_every=100,
-    resume=False
+    resume=False,
+    resume_from=None
 ):
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     set_seed(seed)
+
+    
 
     os.makedirs(out_dir, exist_ok=True)
     ckpt_path = os.path.join(out_dir, f"best_{scheduler_name}_seed{seed}.pth")
@@ -68,25 +71,25 @@ def run_trial(
     scheduler = make_scheduler(scheduler_name, optimizer, epochs)
     scaler = torch.cuda.amp.GradScaler(enabled=(device.startswith("cuda")))
 
-    
-    resume_path = os.path.join(out_dir, f"last_{scheduler_name}_seed{seed}.pth")
+    resume_path_default = os.path.join(out_dir, f"last_{scheduler_name}_seed{seed}.pth")
+    resume_path = resume_from if resume_from is not None else resume_path_default
+
     start_epoch = 1
     best_val_acc = -1.0
     best_epoch = 0
 
+    history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": [], "lr": []}
 
-    if resume and os.path.exists(resume_path):
+    if resume and resume_path is not None and os.path.exists(resume_path):
         start_epoch, best_val_acc = load_last_ckpt(
             resume_path, model, optimizer, scheduler, scaler, device
         )
         best_epoch = start_epoch - 1
-        print(f"[{scheduler_name}] Resuming from epoch {start_epoch} (best_val_acc={best_val_acc:.4f})")
+        print(f"[{scheduler_name}] Resuming from {resume_path} | epoch {start_epoch} (best_val_acc={best_val_acc:.4f})")
 
-    history = {
-        "train_loss": [], "train_acc": [],
-        "val_loss": [], "val_acc": [],
-        "lr": []
-    }
+        ckpt = torch.load(resume_path, map_location=device)
+        if "history" in ckpt and ckpt["history"] is not None:
+            history = ckpt["history"]
 
     t_run0 = time.time()
     for epoch in range(start_epoch, epochs + 1):
@@ -115,11 +118,11 @@ def run_trial(
         )
         torch.save(
           {
-              "model_state": model.state_dict(),
+             "model_state": model.state_dict(),
               "epoch": epoch,
               "best_val_acc": best_val_acc,
               "scheduler": scheduler_name,
-              "lr": lr,
+              "lr": lr,  
               "momentum": momentum,
               "weight_decay": weight_decay,
               "img_size": img_size,
@@ -128,6 +131,7 @@ def run_trial(
               "optimizer_state": optimizer.state_dict(),
               "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
               "scaler_state": scaler.state_dict(),
+              "history": history,  
           },
           last_ckpt_path
         )
@@ -137,26 +141,27 @@ def run_trial(
             best_epoch = epoch
             torch.save(
                 {
-                    "model_state": model.state_dict(),
-                    "epoch": epoch,
-                    "best_val_acc": best_val_acc,
-                    "scheduler": scheduler_name,
-                    "lr": lr,
-                    "momentum": momentum,
-                    "weight_decay": weight_decay,
-                    "img_size": img_size,
-                    "model_name": model_name,
-                    "seed": seed,
-                    "optimizer_state": optimizer.state_dict(),
-                    "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
-                    "scaler_state": scaler.state_dict()
+                  "model_state": model.state_dict(),
+                  "epoch": epoch,
+                  "best_val_acc": best_val_acc,
+                  "scheduler": scheduler_name,
+                  "lr": lr,
+                  "momentum": momentum,
+                  "weight_decay": weight_decay,
+                  "img_size": img_size,
+                  "model_name": model_name,
+                  "seed": seed,
+                  "optimizer_state": optimizer.state_dict(),
+                  "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+                  "scaler_state": scaler.state_dict(),
+                  "history": history,  
                 },
                 ckpt_path
             )
 
     run_secs = time.time() - t_run0
 
-    
+    # Test com o melhor checkpoint
     ckpt = torch.load(ckpt_path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
     test_loss, test_acc = evaluate(model, test_loader, criterion, device)
@@ -281,7 +286,6 @@ def phase1_scheduler_sweep(
         results.append(res)
         histories[sch] = hist
 
-    
     results_sorted = sorted(results, key=lambda d: d["best_val_acc"], reverse=True)
 
     print("\nPHASE 1 summary (sorted by best_val_acc):")
@@ -290,8 +294,6 @@ def phase1_scheduler_sweep(
             f"  {r['scheduler']:9s} | best_val_acc {r['best_val_acc']:.4f} (epoch {r['best_epoch']})"
             f" | test_acc {r['test_acc']:.4f} | minutes {r['run_minutes']:.1f}"
         )
-
-    # salva CSV
     with open(save_csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(results_sorted[0].keys()))
         writer.writeheader()
@@ -372,3 +374,96 @@ def phase2_lr_wd_grid(
 
     print(f"\nSaved: {save_csv_path}")
     return results_sorted
+
+
+def phase2_resume_path(phase2_root, scheduler_name, lr, wd, seed, prefer="last"):
+    lr_s = str(lr)
+    wd_s = str(wd)
+
+    trial_dir = os.path.join(phase2_root, f"{scheduler_name}_lr{lr_s}_wd{wd_s}_seed{seed}")
+    ckpt = os.path.join(trial_dir, f"{prefer}_{scheduler_name}_seed{seed}.pth")
+    return ckpt
+
+def phase3_confirm_configs(
+    train_loader,
+    val_loader,
+    test_loader,
+    *,
+    configs,                 
+    confirm_epochs=40,
+    img_size=160,
+    seed=0,
+    device=None,
+    out_dir="phase3_confirm",
+    save_csv_path="phase3_confirm_results.csv",
+    resume=True,
+):
+    os.makedirs(out_dir, exist_ok=True)
+    results = []
+    PHASE2_ROOT = "/content/drive/MyDrive/FL_PROJECT/Federated-Learning-Under-the-Lens-of-Task-Arithmetic/phase2_grid_cosine"  # ajuste p/ seu caso
+
+    for i, cfg in enumerate(configs, start=1):
+        
+        scheduler_name = cfg.get("scheduler", "cosine")
+
+        resume_from = phase2_resume_path(
+            PHASE2_ROOT,
+            scheduler_name=scheduler_name,
+            lr=cfg["lr"],                 
+            wd=cfg["weight_decay"],       
+            seed=seed,
+            prefer="last"                 
+        )
+
+        lr = float(cfg["lr"])
+        wd = float(cfg["weight_decay"])
+        momentum = float(cfg.get("momentum", 0.9))
+        trial_dir = os.path.join(out_dir, f"cfg{i}_{scheduler_name}_lr{lr}_wd{wd}_seed{seed}")
+        os.makedirs(trial_dir, exist_ok=True)
+
+        print(f"\n=== PHASE 3 | cfg{i}/{len(configs)}: {scheduler_name} lr={lr} wd={wd} epochs={confirm_epochs} ===")
+
+        res, hist = run_trial(
+            scheduler_name=scheduler_name,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            test_loader=test_loader,
+            epochs=confirm_epochs,
+            lr=lr,
+            momentum=momentum,
+            weight_decay=wd,
+            img_size=img_size,
+            seed=seed,
+            device=device,
+            out_dir=trial_dir,
+            log_every=100,
+            resume=resume,
+            resume_from=resume_from 
+        )
+
+        
+
+        res["cfg_id"] = i
+        res["trial_dir"] = trial_dir
+        results.append(res)
+
+    results_sorted = sorted(results, key=lambda d: d["best_val_acc"], reverse=True)
+
+    print("\nPHASE 3 summary (sorted by best_val_acc):")
+    for r in results_sorted:
+        print(
+            f"  cfg{r['cfg_id']} | {r['scheduler']} lr={r['lr']} wd={r['weight_decay']} | "
+            f"best_val_acc={r['best_val_acc']:.4f} (epoch {r['best_epoch']}) | test_acc={r['test_acc']:.4f}"
+        )
+
+    with open(save_csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(results_sorted[0].keys()))
+        writer.writeheader()
+        for r in results_sorted:
+            writer.writerow(r)
+
+    print(f"\nSaved: {save_csv_path}")
+    best = results_sorted[0]
+    print("\n[PHASE 3] Best confirmed config:")
+    print(f"  cfg{best['cfg_id']} | scheduler={best['scheduler']} lr={best['lr']} wd={best['weight_decay']} best_val_acc={best['best_val_acc']:.4f}")
+    return best, results_sorted

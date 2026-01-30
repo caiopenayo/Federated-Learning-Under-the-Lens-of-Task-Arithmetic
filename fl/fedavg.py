@@ -81,20 +81,44 @@ def run_fedavg_experiment(
     """
     # Deep copy global model
     global_model = copy.deepcopy(base_model).to(device)
-    num_clients = len(client_loaders)
-    m = max(int(C * num_clients), 1) # Number of clients to sample
+
+    # Only sample clients that actually have data.
+    # In Non-IID settings (especially small Nc), some clients may end up empty.
+    eligible_clients = []
+    for i, loader in enumerate(client_loaders):
+        if loader is None:
+            continue
+        if hasattr(loader, "dataset") and len(loader.dataset) == 0:
+            continue
+        # len(loader) can be 0 if dataset is tiny vs batch size; still treat as empty.
+        try:
+            if len(loader) == 0:
+                continue
+        except TypeError:
+            pass
+        eligible_clients.append(i)
+
+    if len(eligible_clients) == 0:
+        raise ValueError("No eligible clients with data. Check your partitioning/sharding settings.")
+
+    m = max(int(C * len(eligible_clients)), 1)
+    m = min(m, len(eligible_clients))
     
     history = {'rounds': [], 'test_acc': [], 'loss': []}
     
-    print(f"  [FedAvg] Start: {rounds} rounds, C={C} ({m} clients), J={J} steps")
+    print(
+        f"  [FedAvg] Start: {rounds} rounds, C={C} "
+        f"({m} clients/round from {len(eligible_clients)} eligible), J={J} steps"
+    )
     
     for r in range(1, rounds + 1):
         # 1. Server selects subset of clients
-        selected_indices = np.random.choice(range(num_clients), m, replace=False)
+        selected_indices = np.random.choice(eligible_clients, m, replace=False)
         
         local_models = []
         client_weights = []
-        avg_loss = 0
+        loss_sum = 0.0
+        trained_clients = 0
         
         # 2. Clients train
         for client_idx in selected_indices:
@@ -116,7 +140,8 @@ def run_fedavg_experiment(
             # Assuming batch_size is constant, we can use len(loader) approx or exact counts if known.
             # Using 1.0 for simplicity or sample count if available.
             client_weights.append(len(loader.dataset) if hasattr(loader, 'dataset') else 1.0)
-            avg_loss += loss
+            loss_sum += float(loss)
+            trained_clients += 1
             
         # 3. Server Aggregation
         if local_models:
@@ -138,8 +163,12 @@ def run_fedavg_experiment(
             acc = 100 * correct / total
             history['rounds'].append(r)
             history['test_acc'].append(acc)
-            history['loss'].append(avg_loss / m)
-            print(f"    Round {r:03d} | Test Acc: {acc:.2f}% | Train Loss: {avg_loss/m:.4f}")
+            mean_loss = (loss_sum / trained_clients) if trained_clients > 0 else float('nan')
+            history['loss'].append(mean_loss)
+            print(
+                f"    Round {r:03d} | Test Acc: {acc:.2f}% | "
+                f"Train Loss: {mean_loss:.4f} | Trained clients: {trained_clients}/{m}"
+            )
             
     return history
 

@@ -2,9 +2,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple, Callable, List
 
+import math
 import torch
 import torch.nn as nn
-
 
 MaskDict = Dict[str, torch.Tensor]
 ScoreDict = Dict[str, torch.Tensor]
@@ -22,100 +22,136 @@ def _init_like_named_params(model: nn.Module, fill_value: float = 0.0) -> Dict[s
 def compute_fisher_diag_scores(
     model: nn.Module,
     dataloader: Iterable,
-    criterion: nn.Module,
+    criterion: nn.Module,  # mantido por compatibilidade; não é usado no TaLoS-style
     device: torch.device,
     *,
     max_batches: Optional[int] = None,
     param_filter: Optional[Callable[[str, torch.Tensor], bool]] = None,
 ) -> ScoreDict:
     """
-    Approx diagonal Fisher via empirical E[grad^2] over batches.
-
-    Returns:
-        scores[name] same shape as parameter tensor.
+    TaLoS-style Fisher-diag proxy:
+      - model.eval()
+      - for each batch: forward logits
+      - sample a class from Categorical(logits)
+      - gather the selected logit per sample
+      - do backward per-sample on that selected logit
+      - accumulate grad^2 (no averaging), approx E[grad^2]
     """
-    model.train()  # grads need to flow
-    scores = _init_like_named_params(model, fill_value=0.0)
+    # TaLoS uses eval() for deterministic behavior (no dropout noise, etc.)
+    model = model.to(device)
+    model.eval()
 
     if param_filter is None:
         def param_filter(name: str, p: torch.Tensor) -> bool:
-            return p.requires_grad
+            return bool(p.requires_grad)
 
-    # count batches actually used
-    used = 0
+    # Keep a score tensor per parameter name (same shape as param)
+    scores: ScoreDict = _init_like_named_params(model, fill_value=0.0)
+
+    used_samples = 0
 
     for b_idx, batch in enumerate(dataloader):
         if max_batches is not None and b_idx >= max_batches:
             break
 
-        # Expect either (x, y) or dict-like; adapt if needed
-        if isinstance(batch, (tuple, list)) and len(batch) >= 2:
-            x, y = batch[0], batch[1]
+        if isinstance(batch, (tuple, list)) and len(batch) >= 1:
+            x = batch[0]
         else:
-            raise ValueError("Batch format not supported. Expected (x, y).")
+            raise ValueError("Batch format not supported. Expected (x, y) or (x, ...).")
 
         x = x.to(device, non_blocking=True)
-        y = y.to(device, non_blocking=True)
 
-        model.zero_grad(set_to_none=True)
+        # We need gradients, so do NOT wrap this forward in torch.no_grad().
+        logits = model(x)  # [B, num_classes]
 
-        logits = model(x)
-        loss = criterion(logits, y)
-        loss.backward()
+        # Sample class indices from model distribution (TaLoS-style)
+        with torch.no_grad():
+            sampled_idx = torch.distributions.Categorical(logits=logits).sample()  # [B]
+            sampled_idx = sampled_idx.view(-1, 1)  # [B, 1]
 
-        # accumulate grad^2
-        for name, p in model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if not param_filter(name, p):
-                continue
-            if p.grad is None:
-                continue
-            scores[name].add_(p.grad.detach() ** 2)
+        # Gather the selected logit for each sample: [B, 1] -> squeeze to [B]
+        selected = logits.gather(1, sampled_idx).squeeze(1)
 
-        used += 1
+        # Backprop per-sample, accumulating grad^2
+        # Note: retain_graph=True needed because we backward multiple times on same graph
+        batch_size = selected.shape[0]
+        for i in range(batch_size):
+            model.zero_grad(set_to_none=True)
+            torch.autograd.backward(selected[i], retain_graph=True)
 
-    if used == 0:
-        raise RuntimeError("No batches were used to compute Fisher scores.")
+            for name, p in model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if not param_filter(name, p):
+                    continue
+                if p.grad is None:
+                    continue
+                scores[name].add_(p.grad.detach().pow(2))
 
-    # average
-    for name in list(scores.keys()):
-        scores[name].div_(float(used))
+            used_samples += 1
 
+        # Free graph ASAP
+        del logits, selected
+
+    if used_samples == 0:
+        raise RuntimeError("No samples were used to compute TaLoS-style Fisher scores.")
+
+    # TaLoS code (no snippet) accumulates without normalizing.
+    # If you WANT to match it strictly, keep as-is (no division).
     return scores
 
 
 @dataclass
 class MaskCalibrationConfig:
-    target_sparsity: float            # fraction of parameters to UPDATE (mask==1), e.g., 0.1
-    rounds: int                       # calibration rounds (multi-round)
-    fisher_batches_per_round: int     # how many batches used per round for fisher estimation
-    # if True: pick least-sensitive; for guided extension you can swap rule
-    rule: str = "least_sensitive"     # {"least_sensitive","most_sensitive","lowest_magnitude","highest_magnitude","random"}
+    trainable_fraction: float
+    rounds: int
+    fisher_batches_per_round: int
+    rule: str = "least_sensitive"  # {"least_sensitive","most_sensitive","lowest_magnitude","highest_magnitude","random"}
 
 
-def _flatten_scores(scores: ScoreDict, eligible: MaskDict) -> Tuple[torch.Tensor, List[Tuple[str, torch.Size]]]:
-    """
-    Flatten eligible scores into one vector.
-    Returns (flat_scores, meta) where meta stores (name, shape) in order.
-    """
-    flats = []
-    meta: List[Tuple[str, torch.Size]] = []
+def _flatten_scores(
+    scores: ScoreDict,
+    eligible: MaskDict,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[str]]:
+    flat_scores_parts: List[torch.Tensor] = []
+    flat_param_parts: List[torch.Tensor] = []
+    flat_local_parts: List[torch.Tensor] = []
+    param_names: List[str] = []
+    device: Optional[torch.device] = None
+
     for name, s in scores.items():
         if name not in eligible:
             continue
-        # eligible==1 means "still selectable"
+        if device is None:
+            device = s.device
+
         m = eligible[name]
-        if m.dtype != torch.bool:
-            m_bool = m.bool()
-        else:
-            m_bool = m
-        if m_bool.any():
-            flats.append(s[m_bool].reshape(-1))
-            meta.append((name, s.shape))
-    if len(flats) == 0:
-        return torch.empty(0, device=next(iter(scores.values())).device), meta
-    return torch.cat(flats, dim=0), meta
+        m_bool = m if m.dtype == torch.bool else m.bool()
+        if not m_bool.any():
+            continue
+
+        local_idx = m_bool.view(-1).nonzero(as_tuple=False).view(-1)
+        flat_s = s.view(-1).index_select(0, local_idx)
+
+        pid = len(param_names)
+        param_names.append(name)
+        flat_scores_parts.append(flat_s)
+        flat_local_parts.append(local_idx)
+        flat_param_parts.append(
+            torch.full((local_idx.numel(),), pid, device=local_idx.device, dtype=torch.long)
+        )
+
+    if len(flat_scores_parts) == 0:
+        empty_device = device if device is not None else torch.device("cpu")
+        empty = torch.empty(0, device=empty_device)
+        return empty, empty.to(dtype=torch.long), empty.to(dtype=torch.long), []
+
+    return (
+        torch.cat(flat_scores_parts, dim=0),
+        torch.cat(flat_param_parts, dim=0),
+        torch.cat(flat_local_parts, dim=0),
+        param_names,
+    )
 
 
 def calibrate_gradient_mask_multi_round(
@@ -128,27 +164,26 @@ def calibrate_gradient_mask_multi_round(
     param_filter: Optional[Callable[[str, torch.Tensor], bool]] = None,
 ) -> MaskDict:
     """
-    Produces a binary mask per-parameter tensor, where 1 means "allow updates", 0 means "freeze".
-
-    Multi-round strategy:
-    - Maintain 'selected' set (mask==1) growing each round
-    - Maintain 'eligible' set among remaining parameters to be selected in future rounds
+    TaLoS-like multi-round calibration:
+      - selected grows by union across rounds
+      - each round recomputes scores on CURRENT model
+      - selection uses a quantile/threshold over eligible scores, then trims to exact k
+      - per-round budget is ceil(remaining / remaining_rounds)
     """
-    assert 0.0 < cfg.target_sparsity <= 1.0, "target_sparsity must be in (0,1]."
-    assert cfg.rounds >= 1, "rounds must be >= 1."
+    assert 0.0 < cfg.trainable_fraction <= 1.0
+    assert cfg.rounds >= 1
 
     model = model.to(device)
 
     if param_filter is None:
         def param_filter(name: str, p: torch.Tensor) -> bool:
-            # Typical default: skip classifier head? (optional)
-            return p.requires_grad
+            return bool(p.requires_grad)
 
-    # masks:
+    # init masks
     selected: MaskDict = {}
     eligible: MaskDict = {}
-
     total_params = 0
+
     for name, p in model.named_parameters():
         if not p.requires_grad or not param_filter(name, p):
             continue
@@ -156,127 +191,101 @@ def calibrate_gradient_mask_multi_round(
         eligible[name] = torch.ones_like(p, dtype=torch.bool, device=p.device)
         total_params += p.numel()
 
-    target_k = int(round(cfg.target_sparsity * total_params))
-    target_k = max(1, min(target_k, total_params))
-
-    # how many to add per round (roughly equal split; last round adjusts)
-    base_add = max(1, target_k // cfg.rounds)
+    k_trainable = int(round(cfg.trainable_fraction * total_params))
+    k_trainable = max(1, min(k_trainable, total_params))
 
     for r in range(cfg.rounds):
         already = sum(int(m.sum().item()) for m in selected.values())
-        remaining_to_pick = target_k - already
-        if remaining_to_pick <= 0:
+        remaining = k_trainable - already
+        if remaining <= 0:
             break
 
-        add_this_round = base_add if r < cfg.rounds - 1 else remaining_to_pick
-        add_this_round = min(add_this_round, remaining_to_pick)
+        remaining_rounds = cfg.rounds - r
+        add_this_round = int(math.ceil(remaining / float(remaining_rounds)))
+        add_this_round = max(1, min(add_this_round, remaining))
 
-        # Compute Fisher scores for current model
-        scores = compute_fisher_diag_scores(
-            model,
-            dataloader,
-            criterion,
-            device,
-            max_batches=cfg.fisher_batches_per_round,
-            param_filter=param_filter,
-        )
-
-        # Flatten only eligible entries
-        flat, _ = _flatten_scores(scores, eligible)
-        if flat.numel() == 0:
-            break
-
-        # Decide which entries to select based on rule
-        if cfg.rule == "least_sensitive":
-            # pick smallest scores
-            kth = min(add_this_round, flat.numel())
-            thr = torch.kthvalue(flat, kth).values  # threshold among remaining
-            # select <= thr; then trim if slight over-selection happens
-            pick_small = True
-
-        elif cfg.rule == "most_sensitive":
-            kth = min(add_this_round, flat.numel())
-            thr = torch.kthvalue(flat, flat.numel() - kth + 1).values
-            pick_small = False
+        # scores depending on rule
+        if cfg.rule in ("least_sensitive", "most_sensitive"):
+            scores = compute_fisher_diag_scores(
+                model, dataloader, criterion, device,
+                max_batches=cfg.fisher_batches_per_round,
+                param_filter=param_filter,
+            )
+            pick_small = (cfg.rule == "least_sensitive")
 
         elif cfg.rule in ("lowest_magnitude", "highest_magnitude"):
-            # use |w| instead of fisher
-            weights_scores: ScoreDict = {}
+            scores = {}
             for name, p in model.named_parameters():
                 if name in eligible:
-                    weights_scores[name] = p.detach().abs()
-            flat, _ = _flatten_scores(weights_scores, eligible)
-            kth = min(add_this_round, flat.numel())
-            if cfg.rule == "lowest_magnitude":
-                thr = torch.kthvalue(flat, kth).values
-                pick_small = True
-            else:
-                thr = torch.kthvalue(flat, flat.numel() - kth + 1).values
-                pick_small = False
-            scores = weights_scores  # reuse downstream
+                    scores[name] = p.detach().abs()
+            pick_small = (cfg.rule == "lowest_magnitude")
 
         elif cfg.rule == "random":
-            # random pick among eligible positions
-            # implemented by generating random scores
-            rand_scores: ScoreDict = {}
-            for name, m in eligible.items():
-                rand_scores[name] = torch.rand_like(m.float())
-            scores = rand_scores
-            flat, _ = _flatten_scores(scores, eligible)
-            kth = min(add_this_round, flat.numel())
-            thr = torch.kthvalue(flat, kth).values
+            scores = {name: torch.rand_like(m.float()) for name, m in eligible.items()}
             pick_small = True
 
         else:
             raise ValueError(f"Unknown rule: {cfg.rule}")
 
-        # Apply selection back to per-parameter tensors
-        picked_total = 0
-        for name, s in scores.items():
-            if name not in eligible:
-                continue
-            m = eligible[name]
-            if pick_small:
-                to_pick = (m & (s <= thr))
+        flat, flat_param_ids, flat_local_ids, param_names = _flatten_scores(scores, eligible)
+        if flat.numel() == 0:
+            break
+
+        # ---- TaLoS-like: thresholding via quantile, then trim to exact budget ----
+        # We want approx "add_this_round" elements selected among eligible in this round.
+        k = min(add_this_round, flat.numel())
+
+        if pick_small:
+            # select those <= q where q is k-th smallest (quantile)
+            # Use kthvalue for determinism.
+            kth = torch.kthvalue(flat, k).values
+            cand = (flat <= kth)
+        else:
+            # select those >= kth largest
+            kth = torch.kthvalue(flat, flat.numel() - k + 1).values
+            cand = (flat >= kth)
+
+        cand_idx = cand.nonzero(as_tuple=False).view(-1)
+
+        # If threshold yields too many (ties), trim deterministically by sorting key
+        if cand_idx.numel() > k:
+            cand_scores = flat.index_select(0, cand_idx)
+            # stable-ish tie-break: add tiny index-based perturbation
+            if cand_scores.dtype.is_floating_point:
+                eps = torch.finfo(cand_scores.dtype).eps
+                max_abs = cand_scores.detach().abs().max()
+                tiny = (eps * (max_abs + 1.0)) / float(cand_scores.numel() + 1)
+                idx = cand_idx.to(dtype=cand_scores.dtype)
+                key = cand_scores + idx * tiny if pick_small else cand_scores - idx * tiny
             else:
-                to_pick = (m & (s >= thr))
+                key = cand_scores
 
-            # trim if we overshoot
-            if to_pick.any():
-                idx = to_pick.view(-1).nonzero(as_tuple=False).view(-1)
-                need = add_this_round - picked_total
-                if need <= 0:
-                    break
-                if idx.numel() > need:
-                    idx = idx[:need]
-                # update masks
-                flat_sel = selected[name].view(-1)
-                flat_elig = eligible[name].view(-1)
-                flat_sel[idx] = True
-                flat_elig[idx] = False
-                picked_total += idx.numel()
+            # pick best k among candidates
+            # For pick_small: smallest keys; else: largest keys
+            sel_local = torch.topk(key, k=k, largest=not pick_small).indices
+            sel_global = cand_idx.index_select(0, sel_local)
+        else:
+            # If too few due to weird distribution (rare), fall back to topk on all
+            if cand_idx.numel() < k:
+                # direct topk (same as your original)
+                largest = not pick_small
+                sel_global = torch.topk(flat, k=k, largest=largest).indices
+            else:
+                sel_global = cand_idx  # exact match
 
-        # If threshold selection undershoots (possible with many equal values), fill randomly
-        if picked_total < add_this_round:
-            deficit = add_this_round - picked_total
-            # collect all remaining eligible positions
-            rem = []
-            for name, m in eligible.items():
-                if m.any():
-                    idx = m.view(-1).nonzero(as_tuple=False).view(-1)
-                    rem.append((name, idx))
-            if rem:
-                # sample without replacement across tensors
-                # (simple: iterate until deficit is zero)
-                for name, idx in rem:
-                    if deficit <= 0:
-                        break
-                    take = min(deficit, idx.numel())
-                    chosen = idx[torch.randperm(idx.numel(), device=idx.device)[:take]]
-                    selected[name].view(-1)[chosen] = True
-                    eligible[name].view(-1)[chosen] = False
-                    deficit -= take
+        # map back
+        sel_param_ids = flat_param_ids.index_select(0, sel_global)
+        sel_local_ids = flat_local_ids.index_select(0, sel_global)
 
-    # Convert bool mask to {0,1} float masks if you prefer multiplying grads
+        # update masks (union)
+        for pid in sel_param_ids.unique():
+            pid_int = int(pid.item())
+            name = param_names[pid_int]
+            mask = (sel_param_ids == pid)
+            local_idx = sel_local_ids[mask]
+            selected[name].view(-1)[local_idx] = True
+            eligible[name].view(-1)[local_idx] = False
+
+    # final float mask for grad-multiplication
     final_mask: MaskDict = {k: v.to(dtype=torch.float32) for k, v in selected.items()}
     return final_mask

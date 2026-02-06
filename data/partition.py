@@ -12,17 +12,6 @@ def iid_shard(train_subset, K, seed=42):
     return [shard.tolist() for shard in shards]
 
 def noniid_shard_by_nc_disjoint(train_subset, K, Nc, seed=42, num_classes=100):
-    """
-    Retorna:
-      client_indices: list[K] de listas de índices (relativos ao train_subset),
-                      disjuntos (sem overlap) e sem duplicatas.
-      client_classes: list[K] de listas com as classes atribuídas a cada cliente.
-
-    Propriedades:
-      - Cada cliente recebe exemplos APENAS de Nc classes (client_classes[k]).
-      - Os exemplos são amostrados SEM reposição (disjunto).
-      - Tamanhos ~iguais: distribui n//K para todos e reparte o resto (n%K) nos primeiros clientes.
-    """
     rng = np.random.default_rng(seed)
 
     n = len(train_subset)
@@ -30,24 +19,18 @@ def noniid_shard_by_nc_disjoint(train_subset, K, Nc, seed=42, num_classes=100):
     remainder = n % K
     client_sizes = [base_size + (1 if k < remainder else 0) for k in range(K)]
 
-    # 1) obter labels do subset (índices relativos ao train_subset)
     base_ds = train_subset.dataset
-    subset_indices = np.array(train_subset.indices)  # índices no dataset base
-    labels = np.array(base_ds.targets)[subset_indices]  # labels alinhados ao subset (len == n)
+    subset_indices = np.array(train_subset.indices)  
+    labels = np.array(base_ds.targets)[subset_indices]  
 
-    # 2) agrupar posições do subset por classe (listas serão "pools" que vamos consumir via pop)
     class_to_pool = defaultdict(list)
     for subset_pos, y in enumerate(labels):
         class_to_pool[int(y)].append(subset_pos)
 
-    # embaralha cada pool de classe
     for c in class_to_pool:
         rng.shuffle(class_to_pool[c])
 
-    # 3) escolher classes e alocar exemplos por cliente (SEM reposição)
-    # IMPORTANTE: escolher classes ANTES de consumir para *todos* os clientes causa oversubscription,
-    # especialmente para Nc pequeno (ex.: Nc=1), deixando muitos clientes vazios.
-    # Aqui fazemos escolha + consumo sequencialmente para refletir o estado atual das pools.
+   
     client_indices = [[] for _ in range(K)]
     client_classes = [[] for _ in range(K)]
 
@@ -56,19 +39,16 @@ def noniid_shard_by_nc_disjoint(train_subset, K, Nc, seed=42, num_classes=100):
         if target == 0:
             continue
 
-        # classes candidatas com pelo menos 1 exemplo restante
         candidates = [c for c in range(num_classes) if len(class_to_pool.get(c, [])) > 0]
         if len(candidates) == 0:
             continue
 
-        # ordena por tamanho do pool (desc), com ruído aleatório pra desempate
         rng.shuffle(candidates)
         candidates.sort(key=lambda c: len(class_to_pool[c]), reverse=True)
 
         chosen = candidates[:Nc] if len(candidates) >= Nc else candidates
         client_classes[k] = chosen
 
-        # round-robin nas classes escolhidas para manter mistura (quando Nc>1)
         ptr = 0
         while len(client_indices[k]) < target:
             c = chosen[ptr % len(chosen)]
@@ -77,7 +57,7 @@ def noniid_shard_by_nc_disjoint(train_subset, K, Nc, seed=42, num_classes=100):
             pool = class_to_pool.get(c, [])
             if len(pool) == 0:
                 if all(len(class_to_pool.get(cc, [])) == 0 for cc in chosen):
-                    break  # não dá pra completar mantendo o requisito "somente Nc classes"
+                    break  
                 continue
 
             client_indices[k].append(pool.pop())
@@ -89,7 +69,7 @@ def make_client_loaders(train_subset, client_indices, batch_size=64, num_workers
     loaders = []
     for idxs in client_indices:
         if len(idxs) == 0:
-            loaders.append(None)   # marca cliente vazio
+            loaders.append(None)   
             continue
 
         ds_k = Subset(train_subset, idxs)

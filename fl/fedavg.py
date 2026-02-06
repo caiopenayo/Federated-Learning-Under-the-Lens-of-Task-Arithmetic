@@ -6,14 +6,9 @@ from optim.sparse_sgdm import SparseSGDM
 import os
 
 def fed_avg_aggregate(global_model, client_models, client_weights):
-    """
-    Aggregates client models into the global model using weighted averaging.
-    w_global = sum(n_k * w_k) / sum(n_k)
-    """
     global_dict = global_model.state_dict()
     new_dict = copy.deepcopy(global_dict)
     
-    # Reset accumulators to zero
     for key in new_dict.keys():
         new_dict[key] = torch.zeros_like(new_dict[key], dtype=torch.float32)
         
@@ -80,19 +75,9 @@ def run_fedavg_experiment(
     mask=None,
     resume=False,
     ckpt_path=None,
-    ckpt_every=20,   # NEW: save checkpoint every N rounds
+    ckpt_every=20,   # save checkpoint every N rounds
 ):
-    """
-    Runs the FedAvg algorithm with optional checkpointing/resume.
-
-    Args:
-        C: Client participation rate (0.0 to 1.0)
-        J: Number of local steps
-        resume: if True, attempt to resume from ckpt_path
-        ckpt_path: path to save/load checkpoint
-        ckpt_every: save checkpoint every N rounds (in addition to log/eof)
-    """
-    assert ckpt_path is not None, "Please provide ckpt_path to enable safe resume."
+    assert ckpt_path is not None, 
 
     # Deep copy global model
     global_model = copy.deepcopy(base_model).to(device)

@@ -22,7 +22,7 @@ def _init_like_named_params(model: nn.Module, fill_value: float = 0.0) -> Dict[s
 def compute_fisher_diag_scores(
     model: nn.Module,
     dataloader: Iterable,
-    criterion: nn.Module,  # mantido por compatibilidade; não é usado no TaLoS-style
+    criterion: nn.Module, 
     device: torch.device,
     *,
     max_batches: Optional[int] = None,
@@ -37,7 +37,7 @@ def compute_fisher_diag_scores(
       - do backward per-sample on that selected logit
       - accumulate grad^2 (no averaging), approx E[grad^2]
     """
-    # TaLoS uses eval() for deterministic behavior (no dropout noise, etc.)
+
     model = model.to(device)
     model.eval()
 
@@ -45,7 +45,6 @@ def compute_fisher_diag_scores(
         def param_filter(name: str, p: torch.Tensor) -> bool:
             return bool(p.requires_grad)
 
-    # Keep a score tensor per parameter name (same shape as param)
     scores: ScoreDict = _init_like_named_params(model, fill_value=0.0)
 
     used_samples = 0
@@ -231,8 +230,7 @@ def calibrate_gradient_mask_multi_round(
         if flat.numel() == 0:
             break
 
-        # ---- TaLoS-like: thresholding via quantile, then trim to exact budget ----
-        # We want approx "add_this_round" elements selected among eligible in this round.
+
         k = min(add_this_round, flat.numel())
 
         if pick_small:
